@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -16,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Println("data directory should be passed as second argument")
+		fmt.Fprintln(os.Stderr, "tess-checker \"PATH TO DATASET\"")
 		return
 	}
 
@@ -41,7 +43,6 @@ func main() {
 			}
 
 			recognized := recognize(v)
-
 			stat := new(statx).
 				BuildHeatMap(t, recognized).
 				MedianRecognitionLatency(recognized).
@@ -90,10 +91,11 @@ func buildPairs(dataset string) (map[string][]string, error) {
 				return
 			}
 			atomic.AddUint64(&dirCount, 1)
+			curDir := path.Join(dataset, dir.Name())
 
-			sub, err := ioutil.ReadDir(dir.Name())
+			sub, err := ioutil.ReadDir(curDir)
 			if err != nil {
-				log.Printf("error: can't read subdirectory %q: %v\n", dir.Name(), err)
+				log.Printf("error: can't read subdirectory %q: %v\n", curDir, err)
 				return
 			}
 
@@ -104,7 +106,7 @@ func buildPairs(dataset string) (map[string][]string, error) {
 				if f.Size() == 0 || f.IsDir() {
 					atomic.AddUint64(&skippedCount, 1)
 
-					log.Printf("%q skipped (due to empty or directory) %v\n", dir.Name(), err)
+					log.Printf("%q skipped (due to empty file or directory found) %v\n", curDir, err)
 					continue
 				}
 				if strings.HasSuffix(f.Name(), ".target") {
@@ -115,7 +117,7 @@ func buildPairs(dataset string) (map[string][]string, error) {
 			}
 
 			if target == "" {
-				log.Printf("%q entirely skipped: .target file was not found\n", dir.Name())
+				log.Printf("%q entirely skipped: .target file was not found\n", curDir)
 				atomic.AddUint64(&skippedCount, uint64(len(v)))
 				return
 			}
@@ -129,6 +131,10 @@ func buildPairs(dataset string) (map[string][]string, error) {
 	}
 	wg.Wait()
 	log.Printf("%q scanned. target_count=%d photos_count=%d skipped=%d\n", dataset, dirCount, filesCount, skippedCount)
+	log.Printf("targets are follows:\n")
+	for name, v := range idx {
+		fmt.Printf("\tpath=%q size=%d\n", name, len(v))
+	}
 
 	return idx, nil
 }
