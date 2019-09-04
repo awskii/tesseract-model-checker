@@ -26,14 +26,12 @@ func main() {
 	if err != nil {
 		log.Fatalln("pairs building failed:", err)
 	}
-
-	var lock sync.Mutex
-	stats := make([]*statx, 0)
+	log.Printf("pairs building finished pairs_count=%d\n", len(pairs))
 
 	var wg sync.WaitGroup
 	for k, v := range pairs {
 		wg.Add(1)
-		go func(target string, photos []string, wg *sync.WaitGroup, lock *sync.Mutex) {
+		go func(target string, photos []string, wg *sync.WaitGroup) {
 			defer wg.Done()
 
 			t, err := parseTarget(target)
@@ -41,21 +39,49 @@ func main() {
 				log.Printf("target parsing: %v\n", err)
 				return
 			}
+			log.Printf("target %q has been parsed", target)
 
 			recognized := recognize(v)
 			stat := new(statx).
 				BuildHeatMap(t, recognized).
 				MedianRecognitionLatency(recognized).
-				MedianLevenshteinDistance(recognized).
-				Precision(t, recognized).
-				Recall(t, recognized)
+				MedianLevenshteinDistance(recognized)
+			// Precision(t, recognized).
+			// Recall(t, recognized)
 
-			lock.Lock()
-			stats = append(stats, stat)
-			lock.Unlock()
-		}(k, v, &wg, &lock)
+			if err := dump(target, stat); err != nil {
+				log.Printf("can't dump results of target %q: %v", target, err)
+			}
+		}(k, v, &wg)
+	}
+	wg.Wait()
+	log.Printf("%d targets has been processed. Check .out files.", len(pairs))
+}
+
+func dump(targetPath string, s *statx) error {
+	fmt.Printf("target=%q total_photos=%d avg_recognition_latency=%s "+
+			"median_recognition_latency=%s median_levenshtein=%d\n",
+		targetPath, s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
+	fmt.Printf("ground truth:\n\t%v\n", s.groundTruth)
+	fmt.Println("results:")
+	for k, v := range s.result {
+		fmt.Printf("\t%v\t\t:%v\n", v, k)
+	}
+	fmt.Printf("confusion heatmap of size %d:\n\twant | got\n", len(s.heat))
+	for k := 0; k < len(s.heat); k++ {
+		fmt.Printf("\t%v: %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
+	}
+	fmt.Println("recall (more is better?):")
+	for k, v := range s.recall {
+		fmt.Printf("\t%v:%v\n", k, v)
 	}
 
+	fmt.Println("precision (more is better):")
+	for k, v := range s.precision {
+		fmt.Printf("\t%v:%v\n", k, v)
+	}
+	fmt.Printf("dumped_at=%s with love <3\n", time.Now())
+	return nil
 }
 
 // buildPairs gets dataset directory and concurrently traverse next-level
@@ -110,10 +136,10 @@ func buildPairs(dataset string) (map[string][]string, error) {
 					continue
 				}
 				if strings.HasSuffix(f.Name(), ".target") {
-					target = f.Name()
+					target = path.Join(curDir, f.Name())
 					continue
 				}
-				v = append(v, f.Name())
+				v = append(v, path.Join(curDir, f.Name()))
 			}
 
 			if target == "" {
@@ -168,6 +194,7 @@ func recognize(picturePaths []string) []recognition {
 			continue
 		}
 		e := time.Now().Sub(s)
+		text = strings.Replace(text, "\n", "", -1)
 		recs = append(recs, recognition{
 			source:  pic,
 			result:  text,
@@ -190,6 +217,7 @@ func parseTarget(targ string) (*target, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 
 	t := new(target)
 	if err := json.NewDecoder(f).Decode(t); err != nil {
@@ -205,57 +233,46 @@ type statx struct {
 	heat      map[int][]rune
 	precision map[string]float64 // k:v are path_to_input:recognition_precision
 	recall    map[string]float64 // k:v are path_to_input:recognition_recall
+	result    map[string]string  // k:v are path_to_input:recognized_text
 
 	totalPhotos       uint64 // total photo count
 	avgLatency        uint64 // simple arithmetic average of recognition latency
 	medianLatency     uint64 // median recognition latency (half latencies are strictly more, another half strictly less)
 	medianLevenshtein uint64 // median recognition error rate
+	groundTruth       string // expected recognition value
 }
 
 func (s *statx) BuildHeatMap(tg *target, rec []recognition) *statx {
 	var (
-		lock sync.RWMutex
-		heat = make(map[int][]rune)
-		wg   sync.WaitGroup
-
+		lock       sync.Mutex
+		heat       = make(map[int][]rune)
+		results    = make(map[string]string)
 		avgLatency uint64
 	)
 
 	for _, r := range rec {
 		avgLatency += uint64(r.latency)
+		results[r.source] = r.result
 
-		wg.Add(2)
-		go func(target *target, r *recognition, wg *sync.WaitGroup) {
-			defer wg.Done()
+		r.levDist = levenshtein(tg.Text, r.result)
 
-			r.levDist = levenshtein(target.Text, r.result)
-		}(tg, &r, &wg)
-
-		go func(target *target, r *recognition, wg *sync.WaitGroup, heat map[int][]rune, lock *sync.RWMutex) {
-			defer wg.Done()
-
-			for i := 0; i < len(target.Text); i++ {
-				if target.Text[i] == r.result[i] {
-					continue
-				}
-				lock.RLock()
-				vec, ok := heat[i]
-				lock.RUnlock()
-				if !ok {
-					vec = make([]rune, 1)
-					vec[0] = rune(target.Text[i])
-				}
-				vec = append(vec, rune(r.result[i]))
-
-				lock.Lock()
-				heat[i] = vec
-				lock.Unlock()
+		for i := 0; i < len(tg.Text); i++ {
+			lock.Lock()
+			vec, ok := heat[i]
+			if !ok {
+				vec = []rune{rune(tg.Text[i])}
 			}
-		}(tg, &r, &wg, heat, &lock)
+			vec = append(vec, rune(r.result[i]))
+			heat[i] = vec
+			lock.Unlock()
+		}
 	}
-	wg.Wait()
+
 	s.avgLatency = avgLatency / uint64(len(rec))
 	s.heat = heat
+	s.totalPhotos = uint64(len(rec))
+	s.result = results
+	s.groundTruth = tg.Text
 
 	return s
 }
@@ -290,7 +307,8 @@ func (s *statx) MedianLevenshteinDistance(rec []recognition) *statx {
 func (s *statx) Precision(tg *target, rec []recognition) *statx {
 	precision := make(map[string]float64)
 	for _, r := range rec {
-		precision[r.source] = float64(len(tg.Text)-r.levDist) / float64(len(tg.Text))
+		v := float64(len(tg.Text)-r.levDist) / float64(len(tg.Text))
+		precision[r.source] = v
 	}
 
 	s.precision = precision
