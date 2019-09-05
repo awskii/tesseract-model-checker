@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -16,18 +17,27 @@ import (
 	"github.com/otiai10/gosseract"
 )
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "tess-checker \"PATH TO DATASET\"")
-		return
-	}
+var (
+	dataset = flag.String("dataset", "", "path to dataset")
+	models  = flag.String("model", "", "path to models directories")
+)
 
-	pairs, err := buildPairs(os.Args[1])
+func init() {
+	flag.Parse()
+	if *dataset == "" || *models == "" {
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
+}
+
+func main() {
+	pairs, err := buildPairs(*dataset)
 	if err != nil {
 		log.Fatalln("pairs building failed:", err)
 	}
 	log.Printf("pairs building finished pairs_count=%d\n", len(pairs))
 
+	var successful int32
 	var wg sync.WaitGroup
 	for k, v := range pairs {
 		wg.Add(1)
@@ -41,47 +51,27 @@ func main() {
 			}
 			log.Printf("target %q has been parsed", target)
 
-			recognized := recognize(v)
-			stat := new(statx).
-				BuildHeatMap(t, recognized).
-				MedianRecognitionLatency(recognized).
-				MedianLevenshteinDistance(recognized)
-			// Precision(t, recognized).
-			// Recall(t, recognized)
+			recognized := recognize(v, *models)
+			if len(recognized) == 0 {
+				log.Println("recognition failed, nothing to post-process.")
+				return
+			}
 
-			if err := dump(target, stat); err != nil {
+			stat := InitStat(t, recognized).
+				BuildHeatMap().
+				MedianRecognitionLatency().
+				MedianLevenshteinDistance().
+				Precision().
+				Recall()
+
+			if err := stat.Dump(target); err != nil {
 				log.Printf("can't dump results of target %q: %v", target, err)
 			}
+			atomic.AddInt32(&successful, 1)
 		}(k, v, &wg)
 	}
 	wg.Wait()
-	log.Printf("%d targets has been processed. Check .out files.", len(pairs))
-}
-
-func dump(targetPath string, s *statx) error {
-	fmt.Printf("target=%q total_photos=%d avg_recognition_latency=%s "+
-			"median_recognition_latency=%s median_levenshtein=%d\n",
-		targetPath, s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
-	fmt.Printf("ground truth:\n\t%v\n", s.groundTruth)
-	fmt.Println("results:")
-	for k, v := range s.result {
-		fmt.Printf("\t%v\t\t:%v\n", v, k)
-	}
-	fmt.Printf("confusion heatmap of size %d:\n\twant | got\n", len(s.heat))
-	for k := 0; k < len(s.heat); k++ {
-		fmt.Printf("\t%v: %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
-	}
-	fmt.Println("recall (more is better?):")
-	for k, v := range s.recall {
-		fmt.Printf("\t%v:%v\n", k, v)
-	}
-
-	fmt.Println("precision (more is better):")
-	for k, v := range s.precision {
-		fmt.Printf("\t%v:%v\n", k, v)
-	}
-	fmt.Printf("dumped_at=%s with love <3\n", time.Now())
-	return nil
+	log.Printf("%d targets has been processed. Check .out files.", atomic.LoadInt32(&successful))
 }
 
 // buildPairs gets dataset directory and concurrently traverse next-level
@@ -174,8 +164,9 @@ type recognition struct {
 
 // validate gets paths to pictures and performs recognition.
 // Evaluates recognition latency and returns slice of recognition results.
-func recognize(picturePaths []string) []recognition {
+func recognize(picturePaths []string, modelPath string) []recognition {
 	client := gosseract.NewClient()
+	client.TessdataPrefix = &modelPath
 	defer client.Close()
 
 	recs := make([]recognition, 0, len(picturePaths))
@@ -206,9 +197,8 @@ func recognize(picturePaths []string) []recognition {
 
 // target holds wanted recognition parameters and 100% correct result.
 type target struct {
-	Lines    int    `json:"lines"`
-	LineSize int    `json:"line_size"`
-	Text     string `json:"text"`
+	Lines int    `json:"lines"`
+	Text  string `json:"text"`
 }
 
 // parseTarget gets path to target file and parses it into target structure.
@@ -228,6 +218,9 @@ func parseTarget(targ string) (*target, error) {
 
 // statx holds all available statistics over recognitions
 type statx struct {
+	// initial data
+	tg  *target
+	rec []recognition
 	// First rune on every position is expected rune. All runes after are incorrectly
 	// recognized runes. position:[]recognized_rune.
 	heat      map[int][]rune
@@ -242,7 +235,11 @@ type statx struct {
 	groundTruth       string // expected recognition value
 }
 
-func (s *statx) BuildHeatMap(tg *target, rec []recognition) *statx {
+func InitStat(tg *target, rec []recognition) *statx {
+	return &statx{tg: tg, rec: rec}
+}
+
+func (s *statx) BuildHeatMap() *statx {
 	var (
 		lock       sync.Mutex
 		heat       = make(map[int][]rune)
@@ -250,17 +247,17 @@ func (s *statx) BuildHeatMap(tg *target, rec []recognition) *statx {
 		avgLatency uint64
 	)
 
-	for _, r := range rec {
+	for i, r := range s.rec {
 		avgLatency += uint64(r.latency)
 		results[r.source] = r.result
 
-		r.levDist = levenshtein(tg.Text, r.result)
+		s.rec[i].levDist = levenshtein(s.tg.Text, r.result)
 
-		for i := 0; i < len(tg.Text); i++ {
+		for i := 0; i < len(s.tg.Text); i++ {
 			lock.Lock()
 			vec, ok := heat[i]
 			if !ok {
-				vec = []rune{rune(tg.Text[i])}
+				vec = []rune{rune(s.tg.Text[i])}
 			}
 			vec = append(vec, rune(r.result[i]))
 			heat[i] = vec
@@ -268,17 +265,17 @@ func (s *statx) BuildHeatMap(tg *target, rec []recognition) *statx {
 		}
 	}
 
-	s.avgLatency = avgLatency / uint64(len(rec))
+	s.avgLatency = avgLatency / uint64(len(s.rec))
 	s.heat = heat
-	s.totalPhotos = uint64(len(rec))
+	s.totalPhotos = uint64(len(s.rec))
 	s.result = results
-	s.groundTruth = tg.Text
+	s.groundTruth = s.tg.Text
 
 	return s
 }
 
-func (s *statx) MedianRecognitionLatency(rec []recognition) *statx {
-	r := recognitionsSortLatency(rec) // typecast for sort by latency interface
+func (s *statx) MedianRecognitionLatency() *statx {
+	r := recognitionsSortLatency(s.rec) // typecast for sort by latency interface
 	sort.Sort(&r)
 
 	m := r.Len() / 2
@@ -289,8 +286,8 @@ func (s *statx) MedianRecognitionLatency(rec []recognition) *statx {
 	return s
 }
 
-func (s *statx) MedianLevenshteinDistance(rec []recognition) *statx {
-	r := recognitionsSortLevenshtein(rec) // typecast for sort by levDist
+func (s *statx) MedianLevenshteinDistance() *statx {
+	r := recognitionsSortLevenshtein(s.rec) // typecast for sort by levDist
 	sort.Sort(&r)
 
 	m := r.Len() / 2
@@ -304,10 +301,10 @@ func (s *statx) MedianLevenshteinDistance(rec []recognition) *statx {
 // Precision is TP/(TP+FP), where
 //  - TP: true positive; all correctly recognized characters
 //  - FP: false positive; incorrectly recognized characters (from same alphabet!)
-func (s *statx) Precision(tg *target, rec []recognition) *statx {
+func (s *statx) Precision() *statx {
 	precision := make(map[string]float64)
-	for _, r := range rec {
-		v := float64(len(tg.Text)-r.levDist) / float64(len(tg.Text))
+	for _, r := range s.rec {
+		v := float64(len(s.tg.Text)-r.levDist) / float64(len(s.tg.Text))
 		precision[r.source] = v
 	}
 
@@ -318,17 +315,22 @@ func (s *statx) Precision(tg *target, rec []recognition) *statx {
 // Recall is TP/(TP+FN), where
 //  - TP: true positive; all correctly recognized characters
 //  - FN: false negative; wanted to recognize but got space or incorrect character from ~Alphabet
-func (s *statx) Recall(tg *target, rec []recognition) *statx {
+func (s *statx) Recall() *statx {
 	recall := make(map[string]float64)
 
-	for _, r := range rec {
+
+	for _, r := range s.rec {
 		var (
 			fn int
 			tp int
 
-			want = strings.NewReader(tg.Text)
+			want = strings.NewReader(s.tg.Text)
 			act  = strings.NewReader(r.result)
 		)
+		// for i, c := range r.result  {
+		//
+		//
+		// }
 
 		for wanted, err := want.ReadByte(); err != nil; {
 			actual, err := act.ReadByte()
@@ -345,11 +347,38 @@ func (s *statx) Recall(tg *target, rec []recognition) *statx {
 			}
 		}
 
+		fmt.Printf("recall tp=%d fn=%d\n", tp, fn)
 		recall[r.source] = float64(tp) / float64(tp+fn)
 	}
 	s.recall = recall
 	return s
 	// eval F-measure
+}
+
+func (s *statx) Dump(targetPath string) error {
+	fmt.Printf("target=%q total_photos=%d avg_recognition_latency=%s "+
+			"median_recognition_latency=%s median_levenshtein=%d\n",
+		targetPath, s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
+	fmt.Printf("ground truth:\n\t%v\n", s.groundTruth)
+	fmt.Println("results:")
+	for k, v := range s.result {
+		fmt.Printf("\t%v\t\t:%v\n", v, k)
+	}
+	fmt.Printf("confusion heatmap of size %d:\n\twant | got\n", len(s.heat))
+	for k := 0; k < len(s.heat); k++ {
+		fmt.Printf("\t%v: %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
+	}
+	fmt.Println("recall (more is better?):")
+	for k, v := range s.recall {
+		fmt.Printf("\t%v:%.3f\n", k, v)
+	}
+
+	fmt.Println("precision (more is better):")
+	for k, v := range s.precision {
+		fmt.Printf("\t%v: %.3f\n", k, v)
+	}
+	fmt.Printf("dumped_at=%s with love <3\n", time.Now())
+	return nil
 }
 
 // Levenshtein distance between s and t.
