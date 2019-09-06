@@ -327,12 +327,12 @@ func (s *statx) Recall() *statx {
 			want = strings.NewReader(s.tg.Text)
 			act  = strings.NewReader(r.result)
 		)
-		// for i, c := range r.result  {
-		//
-		//
-		// }
 
-		for wanted, err := want.ReadByte(); err != nil; {
+		for {
+			wanted, err := want.ReadByte()
+			if err != nil {
+				break
+			}
 			actual, err := act.ReadByte()
 			if err != nil {
 				break
