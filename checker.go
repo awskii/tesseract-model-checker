@@ -167,6 +167,7 @@ type recognition struct {
 func recognize(picturePaths []string, modelPath string) []recognition {
 	client := gosseract.NewClient()
 	client.TessdataPrefix = &modelPath
+	client.SetWhitelist("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<")
 	defer client.Close()
 
 	recs := make([]recognition, 0, len(picturePaths))
@@ -340,6 +341,9 @@ func (s *statx) Recall() *statx {
 			if actual == wanted {
 				tp++
 				continue
+			}
+			if wanted == '<' {
+				fn++
 			}
 			// if got char not from [0-9A-Z<] alphabet
 			if (actual < '0' || actual > '9') && (actual < 'A' || actual > 'Z') && actual != '<' {
