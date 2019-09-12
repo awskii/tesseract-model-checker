@@ -20,6 +20,7 @@ import (
 var (
 	dataset = flag.String("dataset", "", "path to dataset")
 	models  = flag.String("model", "", "path to models directories")
+	output  = flag.String("output", "", "path to put results in")
 )
 
 func init() {
@@ -51,27 +52,27 @@ func main() {
 			}
 			log.Printf("target %q has been parsed", target)
 
-			recognized := recognize(v, *models)
+			recognized := recognize(photos, *models)
 			if len(recognized) == 0 {
 				log.Println("recognition failed, nothing to post-process.")
 				return
 			}
 
-			stat := InitStat(t, recognized).
+			stat := InitStat(t, recognized, *models).
 				BuildHeatMap().
 				MedianRecognitionLatency().
 				MedianLevenshteinDistance().
 				Precision().
 				Recall()
 
-			if err := stat.Dump(target); err != nil {
+			if err := stat.Dump(target, *output); err != nil {
 				log.Printf("can't dump results of target %q: %v", target, err)
 			}
 			atomic.AddInt32(&successful, 1)
 		}(k, v, &wg)
 	}
 	wg.Wait()
-	log.Printf("%d targets has been processed. Check .out files.", atomic.LoadInt32(&successful))
+	log.Printf("%d targets has been processed. Check output directory.", atomic.LoadInt32(&successful))
 }
 
 // buildPairs gets dataset directory and concurrently traverse next-level
@@ -234,10 +235,11 @@ type statx struct {
 	medianLatency     uint64 // median recognition latency (half latencies are strictly more, another half strictly less)
 	medianLevenshtein uint64 // median recognition error rate
 	groundTruth       string // expected recognition value
+	modelPath         string // path to OCR model
 }
 
-func InitStat(tg *target, rec []recognition) *statx {
-	return &statx{tg: tg, rec: rec}
+func InitStat(tg *target, rec []recognition, model string) *statx {
+	return &statx{tg: tg, rec: rec, modelPath: model}
 }
 
 func (s *statx) BuildHeatMap() *statx {
@@ -254,7 +256,7 @@ func (s *statx) BuildHeatMap() *statx {
 
 		s.rec[i].levDist = levenshtein(s.tg.Text, r.result)
 
-		for i := 0; i < len(s.tg.Text); i++ {
+		for i := 0; i < len(s.tg.Text) && i < len(r.result); i++ {
 			lock.Lock()
 			vec, ok := heat[i]
 			if !ok {
@@ -319,7 +321,6 @@ func (s *statx) Precision() *statx {
 func (s *statx) Recall() *statx {
 	recall := make(map[string]float64)
 
-
 	for _, r := range s.rec {
 		var (
 			fn int
@@ -350,8 +351,6 @@ func (s *statx) Recall() *statx {
 				fn++
 			}
 		}
-
-		fmt.Printf("recall tp=%d fn=%d\n", tp, fn)
 		recall[r.source] = float64(tp) / float64(tp+fn)
 	}
 	s.recall = recall
@@ -359,29 +358,44 @@ func (s *statx) Recall() *statx {
 	// eval F-measure
 }
 
-func (s *statx) Dump(targetPath string) error {
-	fmt.Printf("target=%q total_photos=%d avg_recognition_latency=%s "+
-			"median_recognition_latency=%s median_levenshtein=%d\n",
-		targetPath, s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
-	fmt.Printf("ground truth:\n\t%v\n", s.groundTruth)
-	fmt.Println("results:")
-	for k, v := range s.result {
-		fmt.Printf("\t%v\t\t:%v\n", v, k)
+func (s *statx) Dump(targetPath, outputPath string) error {
+	p := path.Join(outputPath, path.Base(s.modelPath))
+	err := os.Mkdir(p, 0770)
+	if err != nil {
+		log.Printf("can't create model directory %q: %v", p, err)
 	}
-	fmt.Printf("confusion heatmap of size %d:\n\twant | got\n", len(s.heat))
-	for k := 0; k < len(s.heat); k++ {
-		fmt.Printf("\t%v: %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
+	out, err := os.Create(path.Join(p, path.Base(targetPath)+".out"))
+	if err != nil {
+		log.Printf("can't open output file: %v", err)
+		out = os.Stdout
 	}
-	fmt.Println("recall (more is better?):")
-	for k, v := range s.recall {
-		fmt.Printf("\t%v:%.3f\n", k, v)
+	if out != os.Stdout {
+		defer out.Close()
 	}
 
-	fmt.Println("precision (more is better):")
-	for k, v := range s.precision {
-		fmt.Printf("\t%v: %.3f\n", k, v)
+	fmt.Fprintf(out, "[target=%q][model=%q] total_photos=%d avg_recognition_latency=%s "+
+			"median_recognition_latency=%s median_levenshtein=%d\n",
+		targetPath, s.modelPath, s.totalPhotos, time.Duration(s.avgLatency),
+		time.Duration(s.medianLatency), s.medianLevenshtein)
+	fmt.Fprintf(out, "ground truth:\n\t%v\n", s.groundTruth)
+	fmt.Fprintln(out, "results:")
+	for k, v := range s.result {
+		fmt.Fprintf(out, "\t%.100v\t\t:%v\n", v, k)
 	}
-	fmt.Printf("dumped_at=%s with love <3\n", time.Now())
+	fmt.Fprintln(out, "recall (more is better?):")
+	for k, v := range s.recall {
+		fmt.Fprintf(out, "\t%v:%.3f\n", k, v)
+	}
+
+	fmt.Fprintln(out, "precision (more is better):")
+	for k, v := range s.precision {
+		fmt.Fprintf(out, "\t%v: %.3f\n", k, v)
+	}
+	fmt.Fprintf(out, "confusion heatmap of size %d:\n\twant | got\n", len(s.heat))
+	for k := 0; k < len(s.heat); k++ {
+		fmt.Fprintf(out, "\t%v: %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
+	}
+	fmt.Fprintf(out, "dumped_at=%s with love <3\n", time.Now())
 	return nil
 }
 
