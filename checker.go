@@ -18,14 +18,14 @@ import (
 )
 
 var (
-	dataset = flag.String("dataset", "", "path to dataset")
-	models  = flag.String("model", "", "path to models directories")
-	output  = flag.String("output", "", "path to put results in")
+	dataset    = flag.String("dataset", "", "path to dataset")
+	modelsPath = flag.String("model", "", "path to models directories")
+	output     = flag.String("output", "", "path to put results in")
 )
 
 func init() {
 	flag.Parse()
-	if *dataset == "" || *models == "" {
+	if *dataset == "" || *modelsPath == "" {
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
@@ -37,39 +37,45 @@ func main() {
 		log.Fatalln("pairs building failed:", err)
 	}
 	log.Printf("pairs building finished pairs_count=%d\n", len(pairs))
+	models, err := parseModelPath(*modelsPath)
+	if err != nil {
+		log.Fatalln("model finding failed:", err)
+	}
 
 	var successful int32
 	var wg sync.WaitGroup
-	for k, v := range pairs {
-		wg.Add(1)
-		go func(target string, photos []string, wg *sync.WaitGroup) {
-			defer wg.Done()
+	for target, photos := range pairs {
+		for _, model := range models {
+			wg.Add(1)
+			go func(target, model string, photos []string, wg *sync.WaitGroup) {
+				defer wg.Done()
 
-			t, err := parseTarget(target)
-			if err != nil {
-				log.Printf("target parsing: %v\n", err)
-				return
-			}
-			log.Printf("target %q has been parsed", target)
+				t, err := parseTarget(target)
+				if err != nil {
+					log.Printf("target parsing: %v\n", err)
+					return
+				}
+				log.Printf("target %q has been parsed", target)
 
-			recognized := recognize(photos, *models)
-			if len(recognized) == 0 {
-				log.Println("recognition failed, nothing to post-process.")
-				return
-			}
+				recognized := recognize(photos, model)
+				if len(recognized) == 0 {
+					log.Println("recognition failed, nothing to post-process.")
+					return
+				}
 
-			stat := InitStat(t, recognized, *models).
-				BuildHeatMap().
-				MedianRecognitionLatency().
-				MedianLevenshteinDistance().
-				Precision().
-				Recall()
+				stat := InitStat(t, recognized, model).
+					BuildHeatMap().
+					MedianRecognitionLatency().
+					MedianLevenshteinDistance().
+					Precision().
+					Recall()
 
-			if err := stat.Dump(target, *output); err != nil {
-				log.Printf("can't dump results of target %q: %v", target, err)
-			}
-			atomic.AddInt32(&successful, 1)
-		}(k, v, &wg)
+				if err := stat.Dump(target, *output); err != nil {
+					log.Printf("can't dump results of target %q: %v", target, err)
+				}
+				atomic.AddInt32(&successful, 1)
+			}(target, model, photos, &wg)
+		}
 	}
 	wg.Wait()
 	log.Printf("%d targets has been processed. Check output directory.", atomic.LoadInt32(&successful))
@@ -156,6 +162,31 @@ func buildPairs(dataset string) (map[string][]string, error) {
 	return idx, nil
 }
 
+func parseModelPath(mpath string) ([]string, error) {
+	models, err := ioutil.ReadDir(mpath)
+	if err != nil {
+		return nil, err
+	}
+
+	var list []string
+	for _, model := range models {
+		if model.Size() == 0 || model.IsDir() {
+			log.Printf("%q model skipped (is empty or subdir)", model.Name())
+			continue
+		}
+		if strings.HasSuffix(model.Name(), ".traineddata") {
+			list = append(list, path.Join(mpath, model.Name()))
+			continue
+		}
+	}
+
+	log.Printf("%q scanned. model_count=%d skipped=%d models are follows:\n", mpath, len(list))
+	for _, name := range list {
+		fmt.Printf("\tpath=%q\n", name)
+	}
+	return list, nil
+}
+
 type recognition struct {
 	source  string
 	result  string
@@ -163,11 +194,18 @@ type recognition struct {
 	levDist int // Levenshtein distance between expected and actual output
 }
 
+func modelName(fpath string) string {
+	return strings.TrimSuffix(path.Base(fpath), ".traineddata")
+}
+
 // validate gets paths to pictures and performs recognition.
 // Evaluates recognition latency and returns slice of recognition results.
 func recognize(picturePaths []string, modelPath string) []recognition {
 	client := gosseract.NewClient()
-	client.TessdataPrefix = &modelPath
+	pref := path.Dir(modelPath)
+	client.TessdataPrefix = &pref
+	fmt.Println(pref, modelName(modelPath))
+	client.Languages = []string{modelName(modelPath)}
 	client.SetWhitelist("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<")
 	defer client.Close()
 
