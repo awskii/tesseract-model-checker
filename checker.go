@@ -180,7 +180,7 @@ func parseModelPath(mpath string) ([]string, error) {
 		}
 	}
 
-	log.Printf("%q scanned. model_count=%d skipped=%d models are follows:\n", mpath, len(list))
+	log.Printf("model_dir=%q model_count=%d models are follows:\n", mpath, len(list))
 	for _, name := range list {
 		fmt.Printf("\tpath=%q\n", name)
 	}
@@ -204,7 +204,6 @@ func recognize(picturePaths []string, modelPath string) []recognition {
 	client := gosseract.NewClient()
 	pref := path.Dir(modelPath)
 	client.TessdataPrefix = &pref
-	fmt.Println(pref, modelName(modelPath))
 	client.Languages = []string{modelName(modelPath)}
 	client.SetWhitelist("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<")
 	defer client.Close()
@@ -411,29 +410,18 @@ func (s *statx) Dump(targetPath, outputPath string) error {
 		defer out.Close()
 	}
 
-	fmt.Fprintf(out, "[target=%q][model=%q] total_photos=%d avg_recognition_latency=%s "+
-			"median_recognition_latency=%s median_levenshtein=%d\n",
-		targetPath, s.modelPath, s.totalPhotos, time.Duration(s.avgLatency),
-		time.Duration(s.medianLatency), s.medianLevenshtein)
-	fmt.Fprintf(out, "ground truth:\n\t%v\n", s.groundTruth)
-	fmt.Fprintln(out, "results:")
+	fmt.Fprintf(out, "[target=%q][model=%q][dumped_at=%s] with love <3\n",targetPath, s.modelPath, time.Now())
+	fmt.Fprintf(out, "total_photos=%d avg_recognition_latency=%s median_recognition_latency=%s median_levenshtein=%d\n",
+		 s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
+	fmt.Fprintln(out, "FILE\t\tRECALL\tPRECISION\tRESULTS")
 	for k, v := range s.result {
-		fmt.Fprintf(out, "\t%.100v\t\t:%v\n", v, k)
+		fmt.Fprintf(out, "%v\t%.3v\t%.3v\t\t%v\n", k, s.recall[k], s.precision[k], v)
 	}
-	fmt.Fprintln(out, "recall (more is better?):")
-	for k, v := range s.recall {
-		fmt.Fprintf(out, "\t%v:%.3f\n", k, v)
-	}
-
-	fmt.Fprintln(out, "precision (more is better):")
-	for k, v := range s.precision {
-		fmt.Fprintf(out, "\t%v: %.3f\n", k, v)
-	}
-	fmt.Fprintf(out, "confusion heatmap of size %d:\n\twant | got\n", len(s.heat))
+	fmt.Fprintf(out, "GROUND TRUTH:\t\t\t\t%v\n\n", s.groundTruth)
+	fmt.Fprintf(out, "CONFUSION MATRIX\nwant got\n")
 	for k := 0; k < len(s.heat); k++ {
-		fmt.Fprintf(out, "\t%v: %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
+		fmt.Fprintf(out, "%3v  %v\n", string(s.heat[k][0]), strings.Split(string(s.heat[k][1:]), ""))
 	}
-	fmt.Fprintf(out, "dumped_at=%s with love <3\n", time.Now())
 	return nil
 }
 
