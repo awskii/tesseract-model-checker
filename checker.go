@@ -44,6 +44,15 @@ func main() {
 
 	var successful int32
 	var wg sync.WaitGroup
+
+	type variant struct {
+		target *target
+		result map[string]string // k:v are model:result
+	}
+
+	var varMu sync.Mutex
+	variants := make(map[string]variant) // k:v is source:variants
+
 	for target, photos := range pairs {
 		for _, model := range models {
 			wg.Add(1)
@@ -64,21 +73,72 @@ func main() {
 				}
 
 				stat := InitStat(t, recognized, model).
-					BuildHeatMap().
-					MedianRecognitionLatency().
-					MedianLevenshteinDistance().
-					Precision().
-					Recall()
+					BuildHeatMap()
+				// MedianRecognitionLatency().
+				// MedianLevenshteinDistance().
+				// Precision().
+				// Recall()
 
-				if err := stat.Dump(target, *output); err != nil {
-					log.Printf("can't dump results of target %q: %v", target, err)
+				// collect varaints for further multi-value consensus
+				varMu.Lock()
+				for file, res := range stat.result {
+					v, ok := variants[file]
+					if !ok {
+						v = variant{result: make(map[string]string), target: stat.tg}
+					}
+					v.result[model] = res
+					variants[file] = v
 				}
+				varMu.Unlock()
+
+				// if err := stat.Dump(target, *output); err != nil {
+				// 	log.Printf("can't dump results of target %q: %v", target, err)
+				// }
 				atomic.AddInt32(&successful, 1)
 			}(target, model, photos, &wg)
 		}
 	}
+
 	wg.Wait()
+
+	// that govnokod employs multi-model consensus
+	for file, variants := range variants {
+		mv := NewMultiValue(variants.result)
+		mv.source = file
+
+		start := time.Now()
+		mvr := mv.Decide()
+		end := time.Now().Sub(start)
+
+		var rec [1]recognition
+		rec[0].source = file
+		rec[0].result = mvr
+
+		s := InitStat(variants.target, rec[:], "multi-model"+path.Base(file)).
+			BuildHeatMap().Precision().Recall()
+
+		var recall, precision float64
+		for _, v:= range s.recall {
+			recall   = v
+			break
+		}
+		for _, v:= range s.precision {
+			precision   = v
+			break
+		}
+		fmt.Printf("recall=%.3f precision=%.3f\n", recall, precision)
+		fmt.Printf("multi-value consensus built for %s\n", end)
+	} // end of consensus govnokod
+
 	log.Printf("%d targets has been processed. Check output directory.", atomic.LoadInt32(&successful))
+}
+
+func mapToVec(m map[string]string) []string {
+	vec := make([]string, 0, len(m))
+	for _, v := range m {
+		vec = append(vec, v)
+	}
+	return vec
 }
 
 // buildPairs gets dataset directory and concurrently traverse next-level
@@ -410,9 +470,9 @@ func (s *statx) Dump(targetPath, outputPath string) error {
 		defer out.Close()
 	}
 
-	fmt.Fprintf(out, "[target=%q][model=%q][dumped_at=%s] with love <3\n",targetPath, s.modelPath, time.Now())
+	fmt.Fprintf(out, "[target=%q][model=%q][dumped_at=%s] with love <3\n", targetPath, s.modelPath, time.Now())
 	fmt.Fprintf(out, "total_photos=%d avg_recognition_latency=%s median_recognition_latency=%s median_levenshtein=%d\n",
-		 s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
+		s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
 	fmt.Fprintln(out, "FILE\t\tRECALL\tPRECISION\tRESULTS")
 	for k, v := range s.result {
 		fmt.Fprintf(out, "%v\t%.3v\t%.3v\t\t%v\n", k, s.recall[k], s.precision[k], v)
@@ -498,4 +558,64 @@ func (r *recognitionsSortLevenshtein) Less(i, j int) bool {
 
 func (r *recognitionsSortLevenshtein) Swap(i, j int) {
 	(*r)[i], (*r)[j] = (*r)[j], (*r)[i]
+}
+
+type MultiValue struct {
+	source  string   // source image
+	model   string   // model which was used for recognition
+	outputs map[string]string // list of model outputs
+	result  string   // final result value. Empty before Decide call.
+}
+
+func NewMultiValue(variants map[string]string) *MultiValue {
+	return &MultiValue{outputs: variants}
+}
+
+func (m *MultiValue) Decide() string {
+	fmt.Printf("source=%q deciding on\n", m.source)
+	// build variants ('consensus vector')
+	aux := make([]map[rune]int, 0, 90) // position:[recognized_rune:approved_count]
+	for usedModel, mres := range m.outputs {
+		mres = strings.Replace(mres, " ", "", -1)
+		fmt.Printf("\t%s - %s\n", mres, usedModel)
+		for i, c := range mres {
+			if i >= len(aux) { // bounds check(sic!)
+				v := make(map[rune]int)
+				aux = append(aux, v)
+			}
+			aux[i][c]++
+		}
+	}
+	// decide which rune has more than half voices
+	var fin string
+	half := len(m.outputs) / 2
+	// fmt.Printf("half is %d\tNotion: N-normal G-garbage F-fallback V-verified S-skipped\n", half)
+	for pos, runes := range aux {
+		_ = pos
+		var d rune       // decided rune
+		var deciders int // deciders count to prevent decide on garbage (garbage has not enough deciders).
+		for char, count := range runes {
+			deciders += count
+			// fmt.Printf("[N] pos=%2d vec=%+v ", pos, runes)
+			if count > half {
+				d = char
+				// fmt.Printf("[V|%s]\n", string(char))
+				break
+			}
+			// fmt.Printf("[S|%s]\n", string(char))
+		}
+		if deciders < (half+1) && d == rune(0) {
+			// fmt.Printf("[G] pos=%2d vec=%+v [S]\n", pos, runes)
+			continue
+		}
+		if d == rune(0) {
+			// fmt.Printf("[F] pos=%2d d=%v vec=%+v\n", pos, d, runes)
+			d = '?'
+			// some fallback over confusion matrices, pattern knowledge and other.
+		}
+		fin += string(d)
+	}
+	m.result = fin
+	fmt.Printf("decided value is %q, len=%d\n", m.result, len(m.result))
+	return m.result
 }
