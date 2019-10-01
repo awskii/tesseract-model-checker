@@ -5,6 +5,7 @@ package gosseract
 // #else
 // #cgo CXXFLAGS: -std=c++0x
 // #cgo LDFLAGS: -llept -ltesseract
+// #cgo CPPFLAGS: -Wno-unused-result
 // #endif
 // #include <stdlib.h>
 // #include <stdbool.h>
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"path/filepath"
 	"strings"
 	"unsafe"
 )
@@ -49,7 +51,7 @@ type Client struct {
 	// TessdataPrefix can indicate directory path to `tessdata`.
 	// It is set `/usr/local/share/tessdata/` or something like that, as default.
 	// TODO: Implement and test
-	TessdataPrefix *string
+	TessdataPrefix string
 
 	// Languages are languages to be detected. If not specified, it's gonna be "eng".
 	Languages []string
@@ -62,14 +64,19 @@ type Client struct {
 	// See http://www.sk-spell.sk.cx/tesseract-ocr-parameters-in-302-version
 	// TODO: Fix link to official page
 	ConfigFilePath string
+
+	// internal flag to check if the instance should be initialized again
+	// i.e, we should create a new gosseract client when language or config file change
+	shouldInit bool
 }
 
 // NewClient construct new Client. It's due to caller to Close this client.
 func NewClient() *Client {
 	client := &Client{
-		api:       C.Create(),
-		Variables: map[SettableVariable]string{},
-		Trim:      true,
+		api:        C.Create(),
+		Variables:  map[SettableVariable]string{},
+		Trim:       true,
+		shouldInit: true,
 	}
 	return client
 }
@@ -88,6 +95,12 @@ func (client *Client) Close() (err error) {
 		client.pixImage = nil
 	}
 	return err
+}
+
+// Version provides the version of Tesseract used by this client.
+func (client *Client) Version() string {
+	version := C.Version(client.api)
+	return C.GoString(version)
 }
 
 // SetImage sets path to image file to be processed OCR.
@@ -143,24 +156,41 @@ func (client *Client) SetLanguage(langs ...string) error {
 	if len(langs) == 0 {
 		return fmt.Errorf("languages cannot be empty")
 	}
+
 	client.Languages = langs
+
+	client.flagForInit()
+
 	return nil
 }
 
+// DisableOutput ...
 func (client *Client) DisableOutput() error {
-	return client.SetVariable(DEBUG_FILE, os.DevNull)
+	err := client.SetVariable(DEBUG_FILE, os.DevNull)
+
+	client.setVariablesToInitializedAPIIfNeeded()
+
+	return err
 }
 
 // SetWhitelist sets whitelist chars.
 // See official documentation for whitelist here https://github.com/tesseract-ocr/tesseract/wiki/ImproveQuality#dictionaries-word-lists-and-patterns
 func (client *Client) SetWhitelist(whitelist string) error {
-	return client.SetVariable(TESSEDIT_CHAR_WHITELIST, whitelist)
+	err := client.SetVariable(TESSEDIT_CHAR_WHITELIST, whitelist)
+
+	client.setVariablesToInitializedAPIIfNeeded()
+
+	return err
 }
 
-// SetBlacklist sets whitelist chars.
-// See official documentation for whitelist here https://github.com/tesseract-ocr/tesseract/wiki/ImproveQuality#dictionaries-word-lists-and-patterns
-func (client *Client) SetBlacklist(whitelist string) error {
-	return client.SetVariable(TESSEDIT_CHAR_BLACKLIST, whitelist)
+// SetBlacklist sets blacklist chars.
+// See official documentation for blacklist here https://github.com/tesseract-ocr/tesseract/wiki/ImproveQuality#dictionaries-word-lists-and-patterns
+func (client *Client) SetBlacklist(blacklist string) error {
+	err := client.SetVariable(TESSEDIT_CHAR_BLACKLIST, blacklist)
+
+	client.setVariablesToInitializedAPIIfNeeded()
+
+	return err
 }
 
 // SetVariable sets parameters, representing tesseract::TessBaseAPI->SetVariable.
@@ -169,6 +199,9 @@ func (client *Client) SetBlacklist(whitelist string) error {
 // Check `client.setVariablesToInitializedAPI` for more information.
 func (client *Client) SetVariable(key SettableVariable, value string) error {
 	client.Variables[key] = value
+
+	client.setVariablesToInitializedAPIIfNeeded()
+
 	return nil
 }
 
@@ -190,12 +223,30 @@ func (client *Client) SetConfigFile(fpath string) error {
 		return fmt.Errorf("the specified config file path seems to be a directory")
 	}
 	client.ConfigFilePath = fpath
+
+	client.flagForInit()
+
+	return nil
+}
+
+// SetTessdataPrefix sets path to the models directory.
+// Environment variable TESSDATA_PREFIX is used as default.
+func (client *Client) SetTessdataPrefix(prefix string) error {
+	if prefix == "" {
+		return fmt.Errorf("tessdata prefix could not be empty")
+	}
+	client.TessdataPrefix = prefix
+	client.flagForInit()
 	return nil
 }
 
 // Initialize tesseract::TessBaseAPI
-// TODO: add tessdata prefix
 func (client *Client) init() error {
+
+	if !client.shouldInit {
+		C.SetPixImage(client.api, client.pixImage)
+		return nil
+	}
 
 	var languages *C.char
 	if len(client.Languages) != 0 {
@@ -209,14 +260,14 @@ func (client *Client) init() error {
 	}
 	defer C.free(unsafe.Pointer(configfile))
 
-	tessdata := C.CString(os.Getenv("TESSERACT_PREFIX"))
-	if client.TessdataPrefix != nil {
-		tessdata = C.CString(*client.TessdataPrefix)
+	var tessdataPrefix *C.char
+	if client.TessdataPrefix != "" {
+		tessdataPrefix = C.CString(client.TessdataPrefix)
 	}
-	defer C.free(unsafe.Pointer(tessdata))
+	defer C.free(unsafe.Pointer(tessdataPrefix))
 
 	errbuf := [512]C.char{}
-	res := C.Init(client.api, tessdata, languages, configfile, &errbuf[0])
+	res := C.Init(client.api, tessdataPrefix, languages, configfile, &errbuf[0])
 	msg := C.GoString(&errbuf[0])
 
 	if res != 0 {
@@ -230,9 +281,19 @@ func (client *Client) init() error {
 	if client.pixImage == nil {
 		return fmt.Errorf("PixImage is not set, use SetImage or SetImageFromBytes before Text or HOCRText")
 	}
+
 	C.SetPixImage(client.api, client.pixImage)
 
+	client.shouldInit = false
+
 	return nil
+}
+
+// This method flag the current instance to be initialized again on the next call to a function that
+// requires a gosseract API initialized: when user change the config file or the languages
+// the instance needs to init a new gosseract api
+func (client *Client) flagForInit() {
+	client.shouldInit = true
 }
 
 // This method sets all the sspecified variables to TessBaseAPI structure.
@@ -245,10 +306,22 @@ func (client *Client) setVariablesToInitializedAPI() error {
 		defer C.free(unsafe.Pointer(k))
 		defer C.free(unsafe.Pointer(v))
 		res := C.SetVariable(client.api, k, v)
-		if bool(res) == false {
+		if !bool(res) {
 			return fmt.Errorf("failed to set variable with key(%v) and value(%v)", key, value)
 		}
 	}
+	return nil
+}
+
+// Call setVariablesToInitializedAPI only if the API is initialized
+// it is useful to call when changing variables that does not requires
+// to init a new tesseract instance. Otherwise it is better to just flag
+// the instance for re-init (Client.flagForInit())
+func (client *Client) setVariablesToInitializedAPIIfNeeded() error {
+	if !client.shouldInit {
+		return client.setVariablesToInitializedAPI()
+	}
+
 	return nil
 }
 
@@ -276,9 +349,10 @@ func (client *Client) HOCRText() (out string, err error) {
 
 // BoundingBox contains the position, confidence and UTF8 text of the recognized word
 type BoundingBox struct {
-	Box        image.Rectangle
-	Word       string
-	Confidence float64
+	Box                                image.Rectangle
+	Word                               string
+	Confidence                         float64
+	BlockNum, ParNum, LineNum, WordNum int
 }
 
 // GetBoundingBoxes returns bounding boxes for each matched word
@@ -305,4 +379,54 @@ func (client *Client) GetBoundingBoxes(level PageIteratorLevel) (out []BoundingB
 	}
 
 	return
+}
+
+// GetAvailableLanguages returns a list of available languages in the default tesspath
+func GetAvailableLanguages() ([]string, error) {
+	languages, err := filepath.Glob(filepath.Join(getDataPath(), "*.traineddata"))
+	if err != nil {
+		return languages, err
+	}
+	for i := 0; i < len(languages); i++ {
+		languages[i] = filepath.Base(languages[i])
+		idx := strings.Index(languages[i], ".")
+		languages[i] = languages[i][:idx]
+	}
+	return languages, nil
+}
+
+// GetBoundingBoxesVerbose returns bounding boxes at word level with block_num, par_num, line_num and word_num
+// according to the c++ api that returns a formatted TSV output. Reference: `TessBaseAPI::GetTSVText`.
+func (client *Client) GetBoundingBoxesVerbose() (out []BoundingBox, err error) {
+	if client.api == nil {
+		return out, fmt.Errorf("TessBaseAPI is not constructed, please use `gosseract.NewClient`")
+	}
+	if err = client.init(); err != nil {
+		return
+	}
+	boxArray := C.GetBoundingBoxesVerbose(client.api)
+	length := int(boxArray.length)
+	defer C.free(unsafe.Pointer(boxArray.boxes))
+	defer C.free(unsafe.Pointer(boxArray))
+
+	for i := 0; i < length; i++ {
+		// cast to bounding_box: boxes + i*sizeof(box)
+		box := (*C.struct_bounding_box)(unsafe.Pointer(uintptr(unsafe.Pointer(boxArray.boxes)) + uintptr(i)*unsafe.Sizeof(C.struct_bounding_box{})))
+		out = append(out, BoundingBox{
+			Box:        image.Rect(int(box.x1), int(box.y1), int(box.x2), int(box.y2)),
+			Word:       C.GoString(box.word),
+			Confidence: float64(box.confidence),
+			BlockNum:   int(box.block_num),
+			ParNum:     int(box.par_num),
+			LineNum:    int(box.line_num),
+			WordNum:    int(box.word_num),
+		})
+	}
+	return
+}
+
+// getDataPath is useful hepler to determine where current tesseract
+// installation stores trained models
+func getDataPath() string {
+	return C.GoString(C.GetDataPath())
 }

@@ -1,2 +1,2 @@
-# github.com/otiai10/gosseract v2.2.1+incompatible
-github.com/otiai10/gosseract
+# github.com/awskii/gosseract v0.0.0-20191001110921-29b5a0254977
+github.com/awskii/gosseract

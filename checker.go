@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/otiai10/gosseract"
+	"github.com/awskii/gosseract"
 )
 
 var (
@@ -203,8 +203,8 @@ func modelName(fpath string) string {
 func recognize(picturePaths []string, modelPath string) []recognition {
 	client := gosseract.NewClient()
 	pref := path.Dir(modelPath)
-	client.TessdataPrefix = &pref
-	client.Languages = []string{modelName(modelPath)}
+	client.SetTessdataPrefix(pref)
+	client.SetLanguage(modelName(modelPath))
 	client.SetWhitelist("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<")
 	defer client.Close()
 
@@ -410,9 +410,9 @@ func (s *statx) Dump(targetPath, outputPath string) error {
 		defer out.Close()
 	}
 
-	fmt.Fprintf(out, "[target=%q][model=%q][dumped_at=%s] with love <3\n",targetPath, s.modelPath, time.Now())
+	fmt.Fprintf(out, "[target=%q][model=%q][dumped_at=%s] with love <3\n", targetPath, s.modelPath, time.Now())
 	fmt.Fprintf(out, "total_photos=%d avg_recognition_latency=%s median_recognition_latency=%s median_levenshtein=%d\n",
-		 s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
+		s.totalPhotos, time.Duration(s.avgLatency), time.Duration(s.medianLatency), s.medianLevenshtein)
 	fmt.Fprintln(out, "FILE\t\tRECALL\tPRECISION\tRESULTS")
 	for k, v := range s.result {
 		fmt.Fprintf(out, "%v\t%.3v\t%.3v\t\t%v\n", k, s.recall[k], s.precision[k], v)
