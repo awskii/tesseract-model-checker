@@ -1,10 +1,10 @@
-BINARY="checker"
+BINARY="bin/"
 DATASET_DIR="data"
 MODELS_DIR="model"
 RESULT_DIR="result"
 
 build:
-	GO111MODULE=off go build -o ${BINARY} .
+	GO111MODULE=off go build -o ${BINARY} ./...
 
 clean:
 	rm ${BINARY} && rm -rf ${RESULT_DIR}/*
