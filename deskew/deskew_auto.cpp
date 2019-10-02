@@ -30,22 +30,22 @@ double detect_skew(const char* filename) {
   double angle = 0.0;
   unsigned num_lines = lines.size();
 
-  vector<double> v;
   for (unsigned i = 0; i < num_lines; i++) {
     line(disp_lines, Point(lines[i][0], lines[i][1]),
         Point(lines[i][2], lines[i][3]), Scalar(0xff, 0, 0));
-    double w = atan2((double)lines[i][3] - lines[i][1],
+    double ax, ay, bx, by;
+    ax = lines[i][0];
+    ay = lines[i][1];
+    bx = lines[i][2];
+    by = lines[i][3];
+    cout << "i=" << i << " ax=" << ax << " bx=" << bx << " ay=" << ay << " by=" << by << endl;
+
+    angle += atan2((double)lines[i][3] - lines[i][1],
         (double)lines[i][2] - lines[i][0]);
-    angle += w;
-    v.push_back(w);
   }
+  cout << "angle=" << angle << " " << "lines=" <<  num_lines << endl;
   angle *= 180/(CV_PI*num_lines);
-
-  sort(v.begin(), v.end());
-  int m = v.size()/2;
-  double med_angle = v[m]*180/CV_PI;
-
-  cout << "angle_avg=" << angle << " " << "angle_median=" << med_angle  << endl;
+  cout << "angle_avg=" << angle << endl;
 
 #ifdef DEBUG
  imshow(filename, disp_lines);
@@ -72,6 +72,7 @@ void deskew(const char* filename, double angle) {
  RotatedRect box = minAreaRect(Mat(points));
  Mat rot_mx, rotated, cropped;
  rot_mx = getRotationMatrix2D(box.center, angle, 1);
+ cout << "src size=" << src_gray.size() << endl;
  warpAffine(src_gray, rotated, rot_mx, src_gray.size(), INTER_CUBIC);
 
  Size box_sz = box.size;
